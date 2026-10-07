@@ -15,6 +15,8 @@
 
 #![cfg(target_arch = "riscv64")]
 
+use core::arch::naked_asm;
+
 /// Saved register state for one task (riscv64). Layout must match the offsets used in the asm below: for one task (riscv64). Layout must match the offsets used in the asm below:
 /// `sp` at 0, `ra` at 8, then `s0`–`s11` at 16, 24, … 104.
 #[repr(C)]
@@ -62,7 +64,26 @@ impl TaskContext {
     /// - Set `sp = stack_top` with 16-byte alignment (RISC-V ABI requires 16-byte aligned stack at function entry).
     /// - Leave `s0`–`s11` zero; they will be loaded on switch.
     pub fn init(&mut self, stack_top: usize, entry: usize) {
-        todo!("set ra = entry, sp = stack_top (16-byte aligned)")
+        // `ra` is where the first `ret` inside `switch_context` will jump, so it
+        // is the coroutine's entry point.
+        self.ra = entry as u64;
+        // The RISC-V ABI requires the stack pointer to be 16-byte aligned at
+        // every function entry; round the given top down to satisfy that.
+        self.sp = (stack_top & !0xf) as u64;
+        // The saved registers are loaded from here on the first switch; start
+        // them at a known value.
+        self.s0 = 0;
+        self.s1 = 0;
+        self.s2 = 0;
+        self.s3 = 0;
+        self.s4 = 0;
+        self.s5 = 0;
+        self.s6 = 0;
+        self.s7 = 0;
+        self.s8 = 0;
+        self.s9 = 0;
+        self.s10 = 0;
+        self.s11 = 0;
     }
 }
 
@@ -71,8 +92,59 @@ impl TaskContext {
 /// In asm: store `sp`, `ra`, `s0`–`s11` to `[a0]` (old), load from `[a1]` (new), zero `a0`/`a1` so we do not leak pointers into the new context, then `ret`.
 ///
 /// Must be `#[unsafe(naked)]` to prevent the compiler from generating a prologue/epilogue.
-pub unsafe fn switch_context(old: &mut TaskContext, new: &TaskContext) {
-    todo!("save callee-saved regs to old, load from new, then ret; use #[unsafe(naked)] + naked_asm!, see module doc for riscv64 ABI and layout")
+///
+/// The `extern "C"` ABI is required for naked functions (the Rust ABI may not be
+/// used) and also guarantees the arguments arrive in `a0`/`a1` exactly as the
+/// assembly below expects.
+///
+/// Note: `options(noreturn)` is deliberately *not* used. Control does return to
+/// the original caller — just via the restored `ra` of a later switch — so
+/// marking the function `noreturn` would let the compiler treat everything after
+/// a call as unreachable and delete it.
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context(old: &mut TaskContext, new: &TaskContext) {
+    // `a0` = old, `a1` = new. Offsets follow the `TaskContext` layout:
+    // sp@0, ra@8, s0@16 ... s11@104.
+    naked_asm!(
+        // ── Save the current (outgoing) context into *old ──
+        "sd sp,   0(a0)",
+        "sd ra,   8(a0)",
+        "sd s0,  16(a0)",
+        "sd s1,  24(a0)",
+        "sd s2,  32(a0)",
+        "sd s3,  40(a0)",
+        "sd s4,  48(a0)",
+        "sd s5,  56(a0)",
+        "sd s6,  64(a0)",
+        "sd s7,  72(a0)",
+        "sd s8,  80(a0)",
+        "sd s9,  88(a0)",
+        "sd s10, 96(a0)",
+        "sd s11, 104(a0)",
+        // ── Restore the incoming context from *new ──
+        "ld sp,   0(a1)",
+        "ld ra,   8(a1)",
+        "ld s0,  16(a1)",
+        "ld s1,  24(a1)",
+        "ld s2,  32(a1)",
+        "ld s3,  40(a1)",
+        "ld s4,  48(a1)",
+        "ld s5,  56(a1)",
+        "ld s6,  64(a1)",
+        "ld s7,  72(a1)",
+        "ld s8,  80(a1)",
+        "ld s9,  88(a1)",
+        "ld s10, 96(a1)",
+        "ld s11, 104(a1)",
+        // Do not leak pointers into the task we are switching to: these are
+        // caller-saved registers, so clobbering them is safe.
+        "li a0, 0",
+        "li a1, 0",
+        // `ret` == `jalr zero, 0(ra)`: jump to new.ra. For a brand-new task that
+        // is its entry point; for a resumed task it is just after its own
+        // `switch_context` call.
+        "ret",
+    );
 }
 
 const STACK_SIZE: usize = 1024 * 64;
@@ -80,7 +152,17 @@ const STACK_SIZE: usize = 1024 * 64;
 /// Allocate a stack for a coroutine. Returns `(buffer, stack_top)` where `stack_top` is the high address
 /// (stack grows down). The buffer must be kept alive for the lifetime of the context using this stack.
 pub fn alloc_stack() -> (Vec<u8>, usize) {
-    todo!("allocate stack buffer, return (buffer, stack_top) with stack_top 16-byte aligned")
+    // A plain heap buffer. The buffer owns the stack memory; it must outlive
+    // every context that uses this stack.
+    let buffer = vec![0u8; STACK_SIZE];
+    // The stack grows downwards, so the initial stack pointer is the *high*
+    // end of the buffer.
+    let stack_top = buffer.as_ptr() as usize + STACK_SIZE;
+    // The 64 KiB size is a multiple of 16, so alignment of `stack_top` follows
+    // from the allocation's alignment (the global allocator hands out suitably
+    // aligned memory).
+    debug_assert_eq!(stack_top % 16, 0, "stack top must be 16-byte aligned");
+    (buffer, stack_top)
 }
 
 #[cfg(test)]
